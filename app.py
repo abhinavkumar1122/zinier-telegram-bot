@@ -240,6 +240,7 @@ def generate_uid():
     log("PORTAL", f"New booking session created — uid={uid} customer={customer}")
     log("DB",     f"INSERT session uid={uid} state=PENDING")
     log("PORTAL", f"Deep link generated → {deep_link}")
+    log("MOCK",   f"[PROD would do] Send deep link to {email} via SMS/email — skipped in demo, share manually")
 
     return jsonify({"uid": uid, "deepLink": deep_link, "customerName": customer})
 
