@@ -20,6 +20,8 @@ import os
 import uuid
 import httpx
 from flask import Flask, request, jsonify
+from datetime import datetime
+from collections import deque
 
 app = Flask(__name__)
 
@@ -27,6 +29,14 @@ TOKEN         = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 BOT_USERNAME  = os.environ.get("BOT_USERNAME", "zinier_test_bot")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "zinier-demo-secret")
 BASE          = f"https://api.telegram.org/bot{TOKEN}"
+
+# In-memory log ring buffer — last 100 entries
+_logs: deque = deque(maxlen=100)
+
+def log(tag: str, msg: str):
+    entry = {"time": datetime.utcnow().strftime("%H:%M:%S"), "tag": tag, "msg": msg}
+    _logs.append(entry)
+    print(f"[{entry['time']}] [{tag}] {msg}")
 
 # ---------------------------------------------------------------------------
 # In-memory session store
@@ -49,9 +59,10 @@ SLOTS = {
 def tg(method: str, **kwargs) -> dict:
     try:
         r = httpx.post(f"{BASE}/{method}", json=kwargs, timeout=10)
+        log("TELEGRAM", f"→ {method} ✅")
         return r.json()
     except Exception as e:
-        print(f"[TG ERROR] {method}: {e}")
+        log("TELEGRAM", f"→ {method} ❌ {e}")
         return {}
 
 def send(chat_id: int, text: str, keyboard: list = None):
@@ -80,8 +91,9 @@ def on_start(chat_id: int, uid: str, first_name: str):
     s = sessions[uid]
     s["chatId"] = chat_id
     s["state"]  = "SLOT_SELECTION"
-    # Production: UPDATE UserNotification SET chatUserId=chatId, state=SLOT_SELECTION WHERE id=uid
-    print(f"[DB] update_session uid={uid} chatId={chat_id} state=SLOT_SELECTION")
+    log("WEBHOOK", f"/start received — uid={uid} chatId={chat_id}")
+    log("DB",      f"UPDATE session uid={uid} → chatId={chat_id}, state=SLOT_SELECTION")
+    log("BOT",     f"Sending slot selection keyboard to chatId={chat_id}")
     send(chat_id,
         f"Hi {first_name}! 👋\n\n"
         f"You have a service appointment request.\n"
@@ -103,8 +115,9 @@ def on_slot(chat_id: int, uid: str, slot_id: str, callback_id: str, message_id: 
     s = sessions[uid]
     s["selectedSlotId"] = slot_id
     s["state"] = "PENDING_CONFIRMATION"
-    # Production: UPDATE UserNotification SET selectedSlotId=slot_id, state=PENDING_CONFIRMATION
-    print(f"[DB] update_session uid={uid} slot={slot_id} state=PENDING_CONFIRMATION")
+    log("WEBHOOK", f"Slot selected — uid={uid} slot={slot_id} ({slot['confirmText']})")
+    log("DB",      f"UPDATE session uid={uid} → selectedSlotId={slot_id}, state=PENDING_CONFIRMATION")
+    log("BOT",     f"Sending confirm/cancel keyboard to chatId={chat_id}")
     answer(callback_id)
     clear_keyboard(chat_id, message_id)
     send(chat_id,
@@ -126,8 +139,9 @@ def on_confirm(chat_id: int, uid: str, callback_id: str):
     s = sessions[uid]
     slot = SLOTS.get(s.get("selectedSlotId", ""), {})
     s["state"] = "CONFIRMED"
-    # Production: EventUtil.executeEvent(dbs, event, reqData, reqData, eventId, START_ACTION)
-    print(f"[PROD] EventUtil.executeEvent() → SQS → Gryffindor workflow. uid={uid}")
+    log("WEBHOOK", f"Booking confirmed — uid={uid} slot={s.get('selectedSlotId')}")
+    log("DB",      f"UPDATE session uid={uid} → state=CONFIRMED")
+    log("PROD",    f"[MOCK] EventUtil.executeEvent() → SQS → Gryffindor workflow → booking complete. uid={uid}")
     answer(callback_id, "Booking confirmed! 🎉")
     send(chat_id,
         f"✅ Booking Confirmed!\n\n"
@@ -142,6 +156,8 @@ def on_cancel(chat_id: int, uid: str, callback_id: str):
     """Customer cancelled."""
     if uid in sessions:
         sessions[uid]["state"] = "CANCELLED"
+    log("WEBHOOK", f"Booking cancelled — uid={uid}")
+    log("DB",      f"UPDATE session uid={uid} → state=CANCELLED")
     answer(callback_id, "Booking cancelled")
     send(chat_id, "❌ Booking cancelled.\n\nContact support if you'd like to reschedule.")
 
@@ -169,7 +185,7 @@ def telegram_webhook():
 
         if text.startswith("/start "):
             uid = text[7:].strip()
-            print(f"[BOT] /start uid={uid} chatId={chat_id}")
+            log("WEBHOOK", f"Received /start — uid={uid} chatId={chat_id} user={first_name}")
             on_start(chat_id, uid, first_name)
         elif text == "/start":
             # bare /start — resend keyboard for existing session
@@ -187,7 +203,7 @@ def telegram_webhook():
         chat_id     = cq["from"]["id"]
         message_id  = cq["message"]["message_id"]
         parts       = data.split(":")
-        print(f"[BOT] callback data={data}")
+        log("WEBHOOK", f"Callback received — data={data} chatId={chat_id}")
 
         if parts[0] == "slot" and len(parts) == 3:
             on_slot(chat_id, parts[2], parts[1], callback_id, message_id)
@@ -221,8 +237,9 @@ def generate_uid():
         "state":        "PENDING",
         "selectedSlotId": None,
     }
-    # Production: CustomerPortalHandler.callUIDRegistration() → lambda → INSERT UserNotification
-    print(f"[DB] create_session uid={uid} customer={customer}")
+    log("PORTAL", f"New booking session created — uid={uid} customer={customer}")
+    log("DB",     f"INSERT session uid={uid} state=PENDING")
+    log("PORTAL", f"Deep link generated → {deep_link}")
 
     return jsonify({"uid": uid, "deepLink": deep_link, "customerName": customer})
 
@@ -230,6 +247,17 @@ def generate_uid():
 # ---------------------------------------------------------------------------
 # Debug + health endpoints
 # ---------------------------------------------------------------------------
+
+@app.route("/logs", methods=["GET"])
+def get_logs():
+    return jsonify({"logs": list(_logs), "count": len(_logs)})
+
+
+@app.route("/logs/clear", methods=["POST"])
+def clear_logs():
+    _logs.clear()
+    return jsonify({"status": "cleared"})
+
 
 @app.route("/sessions", methods=["GET"])
 def list_sessions():
